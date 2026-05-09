@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shanquan"
+dynamic = ["version"]
+description = 'ShanQuan - AI Agent Framework with Parallel Tool Calls'
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = []
+authors = [
+  { name = "cqian-cs", email = "cqian.cs@qq.com" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "aiohttp>=3.9",
+  "orjson>=3.9"
+]
+
+[project.urls]
+Documentation = "https://github.com/cqian-cs/shanquan#readme"
+Issues = "https://github.com/cqian-cs/shanquan/issues"
+Source = "https://github.com/cqian-cs/shanquan"
+
+[tool.hatch.version]
+path = "src/shanquan.py"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src/shanquan.py"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
