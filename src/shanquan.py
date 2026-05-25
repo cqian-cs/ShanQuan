@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026-present cqian-cs <cqian.cs@qq.com>
 #
 # SPDX-License-Identifier: MIT
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import asyncio
 import os
