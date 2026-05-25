@@ -9,9 +9,100 @@ import time
 import random
 import traceback
 import copy
-from typing import Dict, Any, List, Optional, AsyncIterator, Union
+from typing import Dict, Any, List, Optional, AsyncIterator,AsyncGenerator, NotRequired, TypedDict, Literal, Callable, Union
 import concurrent.futures
+import aiohttp
+import orjson
+import ast
+import inspect
 
+class FunctionCall(TypedDict):
+    name: str
+    arguments: str          # JSON string
+
+class ToolCall(TypedDict):
+    id: str
+    index: int
+    type: Literal['function']
+    function: FunctionCall
+
+class TaskData(TypedDict):
+    key: str                # 任务ID
+    f: str                  # 函数名
+    kwargs: dict            # 函数参数
+
+class MultimodalContentAttachment(TypedDict):
+    url: str
+
+class MultimodalContent(TypedDict):
+    type: Literal['text','image_url','video_url','file_url']
+    text: NotRequired[str]
+    image_url: NotRequired[MultimodalContentAttachment]
+    video_url: NotRequired[MultimodalContentAttachment]
+    file_url: NotRequired[MultimodalContentAttachment]
+
+
+class Message(TypedDict):
+    role: Literal['system','user','assistant','tool']
+    content: Union[str,List[MultimodalContent]]
+    tool_calls: NotRequired[list[ToolCall]] # role='assistant' 且调用工具时
+    thinking_content: NotRequired[str]      # role='assistant' 且有思考时
+    tool_call_id: NotRequired[str]         # role='tool' 时
+
+class LLMCustomBodyThinking(TypedDict):
+    type: Literal['enabled', 'disabled']
+
+class LLMCustomBodyResponseFormat(TypedDict):
+    type: Literal['text', 'json_object']
+
+class LLMCustomBody(TypedDict):
+    thinking: LLMCustomBodyThinking # OpenAI格式
+    enable_thinking: bool           # 硅基流动格式
+    response_format: LLMCustomBodyResponseFormat
+
+
+class LLMData(TypedDict):
+    message: Message
+    id: str
+    model: str
+    created: int
+    finish_reason: Literal['stop', 'tool_calls', 'length', 'sensitive', '']
+    completion_tokens: int
+    total_tokens: int
+    cached_tokens: int
+
+class ActData(TypedDict):
+    all_success: bool
+    delta_messages: list[Message]
+
+class AgentData(TypedDict):
+    messages: list[Message]
+    finish_reason: Literal['stop', 'tool_calls', 'length', 'sensitive', '']
+    completion_tokens: int
+    total_tokens: int
+    cached_tokens: int
+
+class _Result(TypedDict):
+    suc: bool               # 任务是否成功
+
+class TaskResult(_Result,TaskData):
+    data: Any               # 任务函数返回值，或报错信息
+
+class LLMResult(_Result, total=False):
+    data: LLMData           # suc=True 时
+    msg: str                # suc=False 时
+
+class ActResult(_Result, total=False):
+    data: ActData
+    msg: str
+
+class AgentResult(_Result, total=False):
+    data: AgentData
+    msg: str
+
+class FetchResult(_Result, total=False):
+    data: Any
+    msg: str
 
 #-----------------------------------------------------------#
 # 名空间工具（用于导入导出python函数）
@@ -21,9 +112,6 @@ import concurrent.futures
 # ns["func1"](*args,**kwargs) 调用func1
 # ns["func2"](*args,**kwargs) 调用func2
 #-----------------------------------------------------------#
-import ast
-import inspect
-import orjson
 def ns_dumps(*items):
     """导出函数到名空间（json字符串）
     可以自动导入函数调用的全局变量和全局函数，但函数内不可以有全局模块，模块要在函数内import。
@@ -465,7 +553,7 @@ def abort(func_name, key_prefix):
     return count
 
 class Batch:
-    def __init__(self,payloads,batch_id=None):
+    def __init__(self,payloads,batch_id:Optional[str]=None):
         self.batch_id = batch_id or f"{time.time_ns()}_{''.join(random.choices('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',k=3))}"
         self.key_payloads = {
             f"{self.batch_id}#{i}": payload
@@ -481,7 +569,7 @@ class Batch:
         if not self.done:
             for func_name in self.func_names:
                 abort(func_name,self.batch_id)
-    async def __aiter__(self):
+    async def __aiter__(self) -> AsyncGenerator[TaskResult, None]:
         async for ret in batch(self.key_payloads):
             payload = self.key_payloads[ret['key']]
             ret.update(payload)
@@ -492,12 +580,8 @@ class Batch:
 #-----------------------------------------------------------#
 # 内置异步工具
 #-----------------------------------------------------------#
-import asyncio
-import random
-from typing import Any, Callable, Dict, Optional, Literal, AsyncGenerator
 
-import aiohttp
-import orjson
+
 
 _session: Optional[aiohttp.ClientSession] = None
 
@@ -513,7 +597,7 @@ async def fetch_text(
     max_retries: int = 3,
     timeout: float = 30.0,
     url_transformer: Optional[Callable[[str], str]] = None
-) -> Dict[str, Any]:
+) -> FetchResult:
     global _session
     if _session is None or _session.closed:
         connector = aiohttp.TCPConnector(
@@ -581,7 +665,7 @@ async def fetch_json(
     max_retries: int = 3,
     timeout: float = 30.0,
     url_transformer: Optional[Callable[[str], str]] = None
-) -> Dict[str, Any]:
+) -> FetchResult:
     ret = await fetch_text(
         url=url,
         method=method,
@@ -662,7 +746,7 @@ async def close_pool():
         await _session.close()
     _session = None
 
-def new_llm_msg(role:Literal['system','user','assistant','tool'],content:str,**kwargs):
+def new_llm_msg(role:Literal['system','user','assistant','tool'],content:str,**kwargs) -> Message:
     return {'role':role,'content':content,**{k:v for k,v in kwargs.items() if v}}
 
 
@@ -719,8 +803,8 @@ async def f_write(x,mode:Literal['system','user','assistant','tool','think'],las
     
 
 async def llm(
-    messages,
-    tool_names=[],
+    messages: list[Message],
+    tool_names: Optional[list[str]] = None,
     ctx_kwargs:Optional[Dict]=None, # llm不可见、工具调用时才会填充的参数。
     url=GLOBAL_STATE['llm_zhipu_host'],
     api_key=GLOBAL_STATE['llm_zhipu_api_key'],
@@ -728,9 +812,9 @@ async def llm(
     temperature=0.2,
     top_p=0.7,
     max_tokens=65536,
-    custom_body = None,
-    f_write=f_write,
-):
+    custom_body:Optional[LLMCustomBody] = None,
+    f_write:Optional[Callable[[str,Literal['system','user','assistant','tool','think']],None]]=f_write,
+)-> LLMResult:
     json_payload = {
         "model": model,
         "messages": messages,
@@ -742,7 +826,7 @@ async def llm(
     }
     ctx_param_names = set(ctx_kwargs.keys()) if ctx_kwargs else None
     tools = []
-    for tool_name in tool_names:
+    for tool_name in (tool_names or []):
         ret = get_tool_description(tool_name,ctx_param_names)
         if ret['suc']:
             tools.append(ret['data'])
@@ -830,11 +914,11 @@ async def llm(
         }
 
 async def act(
-    tool_calls,
+    tool_calls:List[ToolCall],
     ctx_kwargs:Optional[Dict]=None, # llm可见、工具调用时才会填充的参数。
-    batch_id=None,
-    f_write=f_write,
-):
+    batch_id:Optional[str]=None,
+    f_write:Optional[Callable[[str,Literal['system','user','assistant','tool','think']],None]]=f_write,
+)->ActResult:
     if not tool_calls:
         return {'suc': False, 'msg': "No tool_calls found."}
     ctx_param_names = set(ctx_kwargs.keys()) if ctx_kwargs else None
@@ -898,19 +982,19 @@ async def act(
 
 
 async def agent(
-    messages,
-    tool_names=[],
-    ctx_kwargs={}, # llm不可见、工具调用时才会填充的参数。
+    messages:List[Message],
+    tool_names:Optional[List[str]]=None,
+    ctx_kwargs:Optional[Dict]=None, # llm不可见、工具调用时才会填充的参数。
     n_steps = 1,
     temperature=0.2,
     top_p=0.7,
     max_tokens=65536,
-    custom_body = None,
+    custom_body:Optional[LLMCustomBody] = None,
     api_key=GLOBAL_STATE['llm_zhipu_api_key'],
     url=GLOBAL_STATE['llm_zhipu_host'],
     model="glm-4.7-flash",
-    f_write=f_write,
-):
+    f_write:Optional[Callable[[str,Literal['system','user','assistant','tool','think']],None]]=f_write,
+)->AgentResult:
     finish_reason = None
     completion_tokens = 0
     total_tokens = 0
