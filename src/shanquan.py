@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026-present cqian-cs <cqian.cs@qq.com>
 #
 # SPDX-License-Identifier: MIT
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 import asyncio
 import os
@@ -762,6 +762,8 @@ async def llm(
             },
             json=json_payload
         ):            
+            if not line:
+                continue
             if line.startswith(b"data: "):
                 line = line[6:].strip()
                 if line == b"[DONE]":
@@ -801,7 +803,6 @@ async def llm(
                         for tool_call in delta['tool_calls']:
                             tool_calls.append(tool_call)
             except orjson.JSONDecodeError:
-                print(f"[Warning] JSON decode error: {line}")
                 continue
         return {
             'suc': True,
