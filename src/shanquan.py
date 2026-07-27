@@ -104,87 +104,6 @@ class FetchResult(_Result, total=False):
     data: Any
     msg: str
 
-#-----------------------------------------------------------#
-# 名空间工具（用于导入导出python函数）
-#-----------------------------------------------------------#
-# ns_json = ns_dumps(func1,func2,...) 把func1,func2,...打包成JSON
-# ns = ns_loads(ns_json) 导入JSON，ns["函数名"]就是原python函数
-# ns["func1"](*args,**kwargs) 调用func1
-# ns["func2"](*args,**kwargs) 调用func2
-#-----------------------------------------------------------#
-def ns_dumps(*items):
-    """导出函数到名空间（json字符串）
-    可以自动导入函数调用的全局变量和全局函数，但函数内不可以有全局模块，模块要在函数内import。
-    Returns:
-        dict: namespace
-    """    
-    ns_info = {
-        'functions': {},
-        'globals': {}
-    }
-    def add_function(item):
-        source = inspect.getsource(item)
-        tree = ast.parse(source)
-        function_def = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef))
-        
-        function_name = function_def.name
-        if function_name in ns_info['functions']:
-            return
-        args = []
-        defaults = []
-        for arg in function_def.args.args:
-            args.append(arg.arg)
-        for default in function_def.args.defaults:
-            defaults.append(ast.literal_eval(default))
-        function_body = ast.unparse(function_def.body)
-        ns_info['functions'][function_name] = {
-            'name': function_name,
-            'args': args,
-            'defaults': defaults,
-            'body': function_body,
-        }
-        # 收集函数中使用的全局变量
-        global_vars = {}
-        for name, value in item.__globals__.items():
-            if name in function_body and not name.startswith('__'):
-                if callable(value):
-                    add_function(value)
-                elif not inspect.ismodule(value):
-                    global_vars[name] = value
-        ns_info['globals'].update(global_vars)
-    for item in items:
-        if callable(item):
-            add_function(item)
-        elif isinstance(item, tuple) and len(item) == 2:
-            name, value = item
-            if not inspect.ismodule(value):
-                ns_info['globals'][name] = value
-    return orjson.dumps(ns_info)
-
-def ns_loads(json_str):
-    """导入名空间（json字符串）
-    Returns:
-        dict: namespace
-    """
-    ns_info = orjson.loads(json_str)
-    namespace = ns_info['globals'].copy()
-    for func_name, func_data in ns_info['functions'].items():
-        params = []
-        for i, arg in enumerate(func_data['args']):
-            if i >= len(func_data['args']) - len(func_data['defaults']):
-                default_value = repr(func_data['defaults'][i - (len(func_data['args']) - len(func_data['defaults']))])
-                params.append(f"{arg}={default_value}")
-            else:
-                params.append(arg)
-        param_str = ", ".join(params)
-        func_code = f"def {func_data['name']}({param_str}):\n"
-        body_lines = func_data['body'].strip().split('\n')
-        func_code += '\n'.join(f"    {line}" for line in body_lines)
-        exec(func_code, namespace, namespace)
-    return namespace
-#-----------------------------------------------------------#
-
-
 
 #-----------------------------------------------------------#
 # 单机异步进程池工具（以异步的方式，批量调用同步函数）
@@ -206,27 +125,21 @@ def ns_loads(json_str):
 #     ret['key']    (str): 任务ID
 #     ret['f']      (str): 函数名
 #-----------------------------------------------------------#
-_global_ns = None
-def _init_in_process(ns_json):
-    global _global_ns
-    _global_ns = ns_loads(ns_json)
-    
+
 def _run_in_process(key, func_name, kwargs):
     try:
-        f = _global_ns[func_name]
+        f = GLOBAL_STATE['api_table'][func_name]['f']
         ret = f(**kwargs)
         return {'suc': True, 'data': ret, 'key': key, 'f': func_name}
     except Exception as e:
         return {'suc': False, 'data': traceback.format_exc(), 'key': key, 'f': func_name}
 
 class ProcessExecutor:
-    def __init__(self, funcs, n_workers=None):
+    def __init__(self, n_workers=None):
         if n_workers is None:
             n_workers = max(os.cpu_count()//2,1)
         self._pool = concurrent.futures.ProcessPoolExecutor(
-            max_workers=n_workers,
-            initializer=_init_in_process,
-            initargs=(ns_dumps(*funcs),)
+            max_workers=n_workers
         )
     
 
@@ -400,11 +313,6 @@ def init_pool(n_workers=1, global_limit=5000):
     GLOBAL_STATE['global_semaphore'] = asyncio.Semaphore(global_limit)
     GLOBAL_STATE['state_lock'] = asyncio.Lock()
     GLOBAL_STATE['_process_executor'] = ProcessExecutor(
-        funcs = [
-            x['f'] 
-            for x in GLOBAL_STATE['api_table'].values()
-            if not inspect.iscoroutinefunction(x['f'])
-        ],
         n_workers=n_workers
     )
 
