@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026-present cqian-cs <cqian.cs@qq.com>
 #
 # SPDX-License-Identifier: MIT
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import asyncio
 import os
@@ -251,12 +251,14 @@ GLOBAL_STATE: Dict[str, Any] = {
     '_process_executor': None, # 进程池执行器
 }
 
-def func_to_tool(func):
-    """函数装饰器，用于将一个普通Python函数转换为Function Calling的JSON Schema定义。"""
+def func_to_tool(func,ctx_param_names:Optional[list]=None):
+    """函数装饰器，用于将一个普通Python函数转换为Function Calling的JSON Schema定义。跳过ctx_params里的参数"""
     from typing import get_origin, get_args, Literal
     properties = {}
     required_params = []
     for name, param in inspect.signature(func).parameters.items():
+        if ctx_param_names and name in ctx_param_names:
+            continue
         param_schema = {}
         py_type = param.annotation
         param_schema["type"] = {
@@ -316,22 +318,25 @@ def init_pool(n_workers=1, global_limit=5000):
         n_workers=n_workers
     )
 
-def api(qps=None, limit=None):
+def api(qps:Optional[float]=None, limit:Optional[int]=None, ctx_params:Optional[list[str]]=None):
     """
     装饰器：注册 API 到全局状态
+    qps: 每秒最多启动几份（控制间隔）
+    limit: 同时最多运行几份（控制并发）
+    ctx_params: 上下文参数列表（不出现在工具描述里）
     """
     def _command(func):
         interval = 1.0 / qps if qps and qps > 0 else 0
         semaphore = asyncio.Semaphore(limit) if limit else None
-        
+        raw_tool = func_to_tool(func,ctx_params)
         GLOBAL_STATE['api_table'][func.__name__] = {
             'f': func,
             'local_semaphore': semaphore,
             'limit': limit,
             'qps_interval': interval,
-            'tool': func_to_tool(func),
+            'tool': raw_tool,
+            's_param_names':set(inspect.signature(func).parameters.keys())
         }
-        
         # 初始化该 API 的虚拟时间锚点
         if func.__name__ not in GLOBAL_STATE['api_timers']:
             GLOBAL_STATE['api_timers'][func.__name__] = 0.0
@@ -375,7 +380,7 @@ async def _execute(key, func_name, f, kwargs):
     except Exception as e:
         return {'suc': False, 'data': traceback.format_exc(), 'key': key, 'f': func_name}
 
-async def batch(key_payloads: Dict[str, dict]) -> AsyncIterator[Dict[str, Any]]:
+async def batch(key_payloads: Dict[str, dict],ctx_kwargs:Optional[dict]=None) -> AsyncIterator[Dict[str, Any]]:
     """ 批量执行任务 {key: {f:str, kwargs: dict}} -> {suc:bool, data:Any, key:str, f:str}"""
     api_table = GLOBAL_STATE['api_table']
     active_tasks = GLOBAL_STATE['active_tasks']
@@ -407,17 +412,21 @@ async def batch(key_payloads: Dict[str, dict]) -> AsyncIterator[Dict[str, Any]]:
 
     tasks_to_wait = []
     task_map = {} 
-
     now = time.time()
     
     for func_name, tasks in planned_tasks.items():
         func_info = api_table[func_name]
         interval = func_info['qps_interval']
         last_time = max(now, api_timers.get(func_name, 0.0))
-        
+
+        func_ctx_kwargs = {
+            k: ctx_kwargs[k]
+            for k in func_info['s_param_names']
+            if k in ctx_kwargs
+        } if ctx_kwargs else {}
+
         if func_name not in active_tasks:
             active_tasks[func_name] = {}
-            
         for key, payload in tasks:
             delay = 0
             if interval > 0:
@@ -430,7 +439,7 @@ async def batch(key_payloads: Dict[str, dict]) -> AsyncIterator[Dict[str, Any]]:
                 key, 
                 func_name, 
                 func_info['f'],
-                payload.get('kwargs', {}),
+                {**payload.get('kwargs', {}),**func_ctx_kwargs},
                 func_info['local_semaphore'],
                 delay
             )
@@ -461,13 +470,14 @@ def abort(func_name, key_prefix):
     return count
 
 class Batch:
-    def __init__(self,payloads,batch_id:Optional[str]=None):
+    def __init__(self,payloads,ctx_kwargs:Optional[dict]=None,batch_id:Optional[str]=None):
+        self.func_names = set(x['f'] for x in payloads)
         self.batch_id = batch_id or f"{time.time_ns()}_{''.join(random.choices('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',k=3))}"
         self.key_payloads = {
             f"{self.batch_id}#{i}": payload
             for i,payload in enumerate(payloads)
         }
-        self.func_names = set(x['f'] for x in payloads)
+        self.ctx_kwargs = ctx_kwargs
         self.done = False
     async def __aenter__(self):
         return self
@@ -478,7 +488,7 @@ class Batch:
             for func_name in self.func_names:
                 abort(func_name,self.batch_id)
     async def __aiter__(self) -> AsyncGenerator[TaskResult, None]:
-        async for ret in batch(self.key_payloads):
+        async for ret in batch(self.key_payloads,self.ctx_kwargs):
             payload = self.key_payloads[ret['key']]
             ret.update(payload)
             yield ret
@@ -662,17 +672,6 @@ GLOBAL_STATE['llm_zhipu_host'] = "https://open.bigmodel.cn/api/paas/v4/chat/comp
 GLOBAL_STATE['llm_zhipu_api_key'] = os.getenv("ZAI_API_KEY")
 
 
-def get_tool_ctx(tool_name,ctx_param_names:Optional[set]=None):
-    if tool_name not in GLOBAL_STATE['api_table']:
-        return {'suc':False,'msg':f"Tool api not found: {tool_name}"}
-    if 'tool' not in GLOBAL_STATE['api_table'][tool_name]:
-        return {'suc':False,'msg':f"Tool description not found: {tool_name}"}
-    if ctx_param_names is None:
-        return {'suc':True, 'data':set()}
-    raw_tool = GLOBAL_STATE['api_table'][tool_name]['tool']
-    f_param_names = set(raw_tool['function']['parameters']['properties'].keys())
-    masked_param_names = f_param_names & ctx_param_names
-    return {'suc':True, 'data':masked_param_names}
 
 def get_tool_description(tool_name,ctx_param_names:Optional[set]=None):
     if tool_name not in GLOBAL_STATE['api_table']:
@@ -763,16 +762,17 @@ async def llm(
             },
             json=json_payload
         ):            
-            if not line.startswith(b"data: "):
-                continue
-            data_bytes = line[6:].strip()
-            if data_bytes == b"[DONE]":
-                if f_write:
-                    await f_write('\n', 'assistant')
-                break
+            if line.startswith(b"data: "):
+                line = line[6:].strip()
+                if line == b"[DONE]":
+                    if f_write:
+                        await f_write('\n', 'assistant')
+                    break
             try:
-                chunk_data = orjson.loads(data_bytes)
+                chunk_data = orjson.loads(line)
                 if first_chunk:
+                    if 'error' in chunk_data:
+                        return {'suc':False,'msg':chunk_data['error'].get('message',line.decode('utf-8'))}
                     meta_info["id"] = chunk_data.get('id', '')
                     meta_info["model"] = chunk_data.get('model', '')
                     meta_info["created"] = chunk_data.get('created', 0)
@@ -801,6 +801,7 @@ async def llm(
                         for tool_call in delta['tool_calls']:
                             tool_calls.append(tool_call)
             except orjson.JSONDecodeError:
+                print(f"[Warning] JSON decode error: {line}")
                 continue
         return {
             'suc': True,
@@ -846,13 +847,7 @@ async def act(
         if tool_call['type'] != 'function':
             return {'suc': False, 'msg': f"Invalid tool_call type. {tool_call}"}
         f_name = tool_call['function']['name']
-        ret = get_tool_ctx(f_name,ctx_param_names)
-        if not ret['suc']:
-            return {'suc': False, 'msg': ret['msg']}
-        fill_param_names = ret['data']
         f_args = orjson.loads(tool_call['function']['arguments'])
-        for param in fill_param_names:
-            f_args[param] = ctx_kwargs[param]
         payloads.append({
             'key':tool_call['id'],
             #'tool_call': tool_call['function'],
@@ -863,7 +858,7 @@ async def act(
     all_success = True
     delta_messages = []
     try:
-        async with Batch(payloads,batch_id) as futures:
+        async with Batch(payloads,ctx_kwargs,batch_id) as futures:
             progress = 0
             async for ret_tool in futures:
                 progress += 1
