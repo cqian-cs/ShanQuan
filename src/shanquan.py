@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026-present cqian-cs <cqian.cs@qq.com>
 #
 # SPDX-License-Identifier: MIT
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 import asyncio
 import os
@@ -135,25 +135,26 @@ def _run_in_process(key, func_name, kwargs):
         return {'suc': False, 'data': traceback.format_exc(), 'key': key, 'f': func_name}
 
 class ProcessExecutor:
-    def __init__(self, n_workers=None):
-        if n_workers is None:
-            n_workers = max(os.cpu_count()//2,1)
-        self._pool = concurrent.futures.ProcessPoolExecutor(
-            max_workers=n_workers
-        )
-    
+    def __init__(self, n_workers=1):
+        if n_workers > 0:
+            self._pool = concurrent.futures.ProcessPoolExecutor(
+                max_workers=n_workers
+            )
+        else:
+            self._pool = None
 
     async def submit(self, key, func_name, kwargs):
-        cfuture = self._pool.submit(_run_in_process, key, func_name, kwargs)
-        afuture = asyncio.wrap_future(cfuture, loop=asyncio.get_running_loop())
-        try:
-            return await afuture
-        except asyncio.CancelledError:
-            if not cfuture.done():
-                cfuture.cancel()
-            raise
-    def __del__(self, wait=True):
-        self._pool.shutdown(wait=wait)
+        if not self._pool:
+            return _run_in_process(key, func_name, kwargs)
+        else:
+            cfuture = self._pool.submit(_run_in_process, key, func_name, kwargs)
+            afuture = asyncio.wrap_future(cfuture, loop=asyncio.get_running_loop())
+            try:
+                return await afuture
+            except asyncio.CancelledError:
+                if not cfuture.done():
+                    cfuture.cancel()
+                raise
 
 #-----------------------------------------------------------#
 
@@ -314,9 +315,7 @@ def init_pool(n_workers=1, global_limit=5000):
     GLOBAL_STATE['global_limit'] = global_limit
     GLOBAL_STATE['global_semaphore'] = asyncio.Semaphore(global_limit)
     GLOBAL_STATE['state_lock'] = asyncio.Lock()
-    GLOBAL_STATE['_process_executor'] = ProcessExecutor(
-        n_workers=n_workers
-    )
+    GLOBAL_STATE['_process_executor'] = ProcessExecutor(n_workers)
 
 def api(qps:Optional[float]=None, limit:Optional[int]=None, ctx_params:Optional[list[str]]=None):
     """
