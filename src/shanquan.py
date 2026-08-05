@@ -134,6 +134,14 @@ def _run_in_process(key, func_name, kwargs):
     except Exception as e:
         return {'suc': False, 'data': traceback.format_exc(), 'key': key, 'f': func_name}
 
+async def _run_in_corotine(key,func_name,kwargs):
+    try:
+        f = GLOBAL_STATE['api_table'][func_name]['f']
+        ret = f(**kwargs)
+        return {'suc': True, 'data': ret, 'key': key, 'f': func_name}
+    except Exception as e:
+        return {'suc': False, 'data': traceback.format_exc(), 'key': key, 'f': func_name}
+
 class ProcessExecutor:
     def __init__(self, n_workers=1):
         if n_workers > 0:
@@ -141,20 +149,19 @@ class ProcessExecutor:
                 max_workers=n_workers
             )
         else:
-            self._pool = None
+            self._pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers= 1
+            )
 
     async def submit(self, key, func_name, kwargs):
-        if not self._pool:
-            return _run_in_process(key, func_name, kwargs)
-        else:
-            cfuture = self._pool.submit(_run_in_process, key, func_name, kwargs)
-            afuture = asyncio.wrap_future(cfuture, loop=asyncio.get_running_loop())
-            try:
-                return await afuture
-            except asyncio.CancelledError:
-                if not cfuture.done():
-                    cfuture.cancel()
-                raise
+        cfuture = self._pool.submit(_run_in_process, key, func_name, kwargs)
+        afuture = asyncio.wrap_future(cfuture, loop=asyncio.get_running_loop())
+        try:
+            return await afuture
+        except asyncio.CancelledError:
+            if not cfuture.done():
+                cfuture.cancel()
+            raise
 
 #-----------------------------------------------------------#
 
